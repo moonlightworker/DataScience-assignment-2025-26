@@ -1,0 +1,430 @@
+---
+title: "Accessing and reusing public data from PANGAEA - Part 2"
+author: "Johanna Jäger"
+output: html_document
+date: "2026-01-09"
+---
+
+## 1. Setup of RStudio
+
+For this script the metadata text file and the downloaded data sets are needed. If they are not already downloaded please follow the instrucions in part 1: `Pangaea_data_1.ipynb`. \### 1.1 Packages and root directory Load the necessary packages and set the root directory to where the datasets are stored.
+
+```{r setup}
+# List of packages
+packages <- c("tidyverse", "dplyr", "ggplot2", "stringr", "sf", "forcats", "scales", "ggspatial", "lubridate")
+
+# Installation if necessary and loading of packages
+for (p in packages) {
+  if (!require(p, character.only = TRUE)) {
+    install.packages(p)
+    library(p, character.only = TRUE)
+  }
+}
+
+# set directory here, same as dataset_directory
+knitr::opts_knit$set(root.dir = "C:/Users/jojom/Desktop/DataScience/oxygen/datasets/")
+```
+
+Check the version of used packages for reproducibility:
+
+```{r packages version}
+installed.packages()[names(sessionInfo()$otherPkgs), "Version"]
+rm(p)
+```
+
+### 1.2 Setup of the basic variables
+
+If not already done the [PANGAEA parameter list](https://www.pangaea.de/lists/parameter/all-byname) needs to be downloaded to `data_directory` (the parent directory) to store the parameter id, unit and name dynamically.
+
+```{r basic variables}
+parameter <- basename(dirname(getwd()))
+  
+# List the datasets 
+file_list <- list.files(
+  pattern = paste0("PANGAEA_", parameter, "_\\d+_dataset_\\d+\\.txt$"),
+  ignore.case = TRUE
+)
+
+# Extract the parameter id
+id <- sub(".*_(\\d+)_dataset_.*", "\\1", file_list[1])
+
+# Load parameter list to get correct unit and parameter name
+param_table <- read.delim("../pangaea_parameters.tab", 
+                          sep = "\t", header = TRUE)
+unit <- param_table$Unit[param_table$ID.parameter == id]
+```
+
+## 2. Combine datasets to one table
+
+In order to merge all data records into one large table, I limited the input to the entries that each data record should contain:
+
+-   id
+-   date
+-   depth
+-   location (longitude/latitude)
+-   the chosen parameter (salinity, pH, temperature, oxygen, chlorophyll...)
+
+### 2.1 Safe merging
+
+In an attempt to address the various challenges encountered while working with the PANGAEA datasets, efforts have been made to fix every issue that arose. However, there are probably further issues yet to be encountered. Most of the issues are in regard of column names or data types.\
+Among other things, the following code adresses the problem when several columns are named after the parameter (e.g. oxygen concentration [µmol/l] and oxygen saturation [%]). To get around this, the parameter ID is compared with the corresponding unit (using the [PANGAEA parameter list](https://www.pangaea.de/lists/parameter/all-byname)) and columns with the correct unit are transferred. If there are still several matching columns, the data record is skipped and a message is displayed (e.g. for data records with oxygen surface [µmol/l] and oxygen near the bottom [µmol/l]). In order to be able to continue using these data records, manual inspection and decision-making would be necessary.
+
+```{r combine datasets}
+# Specifying the column names
+clean_names <- c(
+  "event", "date", "depth",
+  "longitude", "latitude",
+  parameter
+)
+
+# Desired data types
+column_types <- list(
+  event     = as.character,
+  date      = as.character,
+  depth     = as.numeric,
+  longitude = as.numeric,
+  latitude  = as.numeric
+)
+
+# Add parameter column type
+column_types[[parameter]] <- as.numeric
+
+# Track skipped datasets
+skipped <- 0
+
+# Read, clean, rename, type-convert each file
+combined_data <- file_list %>%
+  lapply(function(file) { 
+    
+    read.delim(file) %>%
+      mutate(
+        id = str_extract(file, "(?<=dataset_)\\d+") %||% "unknown"
+      ) %>%
+      {
+        df <- .
+
+        # Rename messy columns
+        for (clean in clean_names) {
+          matched <- grep(clean, names(df),
+                          ignore.case = TRUE, value = TRUE)
+
+          if (length(matched) >= 1) {
+
+            # If multiple parameter columns match...
+            if (clean == parameter && length(matched) > 1) {
+
+              # 1) Parameter muss vorkommen
+              cand <- matched[grepl(clean, matched, ignore.case = TRUE)]
+              
+              # 2) Einheit optional – wenn vorhanden, bevorzugen
+              cand_unit <- cand[grepl(unit, cand, ignore.case = TRUE)]
+              
+              # 3) Wenn genau eine Einheit-Spalte → nimm sie
+              if (length(cand_unit) == 1) {
+                best <- cand_unit
+                
+              # 4) Wenn keine Einheit-Spalte → nimm die kürzeste Parameter-Spalte
+              } else if (length(cand_unit) == 0) {
+                best <- cand[which.min(nchar(cand))]
+              
+              # 5) Wenn mehrere Einheit-Spalten → nimm die kürzeste
+              } else {
+                best <- cand_unit[which.min(nchar(cand_unit))]
+              }
+
+            } else {
+              # Match all other columns with shortest match
+              best <- matched[which.min(nchar(matched))]
+            }
+
+            # Apply renaming
+            names(df)[names(df) == best] <- clean
+          }
+        }
+
+        # Keep only relevant columns
+        keep_cols <- c("id", clean_names)
+        df <- df %>% select(any_of(keep_cols))
+
+        # Convert types
+        for (col in names(column_types)) {
+          if (col %in% names(df)) {
+            df[[col]] <- column_types[[col]](df[[col]])
+          }
+        }
+
+        df
+      }
+  }) %>%
+  bind_rows()
+
+# Make ID numeric
+combined_data$id <- as.numeric(combined_data$id)
+
+# Save final object with parameter name
+assign(paste0("combined_", parameter), combined_data)
+
+# Print skipped dataset count
+message(skipped, " datasets were skipped due to ambiguous or missing unit matches.")
+
+# Clean up
+rm(combined_data)
+gc()
+```
+
+### 2.2 Adding relevant metadata
+
+The way in which the parameter was measured is another important aspect that should be taken into account, especially with regard to possible troubleshooting. This information is stored in the metadata. Therefore, we filter the corresponding metadata table by device and add the column to the combined table.
+
+```{r adding metadata}
+metadata_file <- list.files(
+  path = "..",
+  pattern = paste0(".*", parameter, ".*", id, ".*metadata.*\\.txt$"),
+  ignore.case = TRUE,
+  full.names = TRUE
+)[1]
+
+metadata <- read.delim(metadata_file) %>%
+  select(ID, device) %>%
+  rename(id = ID)
+
+# Add (join) the devices to the big table
+assign(
+  paste0("combined_", parameter),
+  get(paste0("combined_", parameter)) %>% left_join(metadata, by = "id") 
+)
+```
+
+## 3 Prepare the data for visualization
+
+When preparing the data for visualisation, spatial and statistical filtering must be performed. This involves sorting out a large amount of data; the exact amount is listed in this step.
+
+### 3.1 Spatial filtering
+
+Since the bounding box in pangaeapy is based on the coordinates specified in the metadata, the downloaded data sets may contain data points that lie outside of it. Therefore, an additional geographical filter step must be inserted here. First, the bounding box is set again and all data points outside it are removed. Then a polygon of the Baltic Sea is used to filter out the remaining points that lie within the bounding box but outside the Baltic Sea (e.g. northwest of Norway).
+
+::: {.alert .alert-info style="background-color: lightblue !important;"}
+**Note**: You need to download the Polygon for the Worlds Seas [here](https://marineregions.org/downloads.php#iho) and unzip the files. The `baltic_names` filter is hard-coded, so for different spatial settings please take that into consideration.
+:::
+
+### 3.2 Statistical filtering
+
+It is necessary to filter out impossible values in order to obtain representative data. Errors can occur when measuring with devices or entering data into tables. However, because this workflow is intended to function for all possible different parameters, it is not practical to set hard-coded limits. A robust method for environmental data is the median absolute deviation [(MAD)](https://en.wikipedia.org/wiki/Median_absolute_deviation), which is not greatly affected by outliers.
+
+The filter removes items whose values are: $| x - median(x) | > k * MAD(x)$.\
+$k$ is the threshold and usually between 5 (conservative) and 3 (strict).
+
+```{r preparing data}
+
+baltic_simple <- {
+  # Load the world seas polygon
+  world_seas <- st_read("../World_Seas_IHO_v3/World_Seas_IHO_v3/World_Seas_IHO_v3.shp")
+
+  # Filter for relevant regions
+  baltic_names <- c(
+    "Baltic Sea",
+    "Gulf of Bothnia",
+    "Gulf of Finland",
+    "Gulf of Riga",
+    "Kattegat"
+  )
+
+  world_seas %>%
+    filter(NAME %in% baltic_names) %>%
+    st_make_valid() %>%
+    st_union() %>% # merge the sub-polygons to one
+    st_sf(geometry = ., crs = st_crs(world_seas)) %>%
+    st_simplify(dTolerance = 1500) # simplifying polygon complexity 
+}
+bbox <- st_bbox(baltic_simple) 
+
+df <- get(paste0("combined_", parameter))
+n_start <- nrow(df) # initial row number
+
+# Remove NA coordinates
+df <- df %>% filter(!is.na(longitude), !is.na(latitude))
+n_after_na <- nrow(df)
+
+# Bounding box filter
+df <- df %>%
+  filter(
+    longitude >= bbox["xmin"], longitude <= bbox["xmax"],
+    latitude >= bbox["ymin"], latitude <= bbox["ymax"]
+  )
+n_after_bbox <- nrow(df)
+
+# Spatial intersection
+df <- {
+  df_sf <- st_as_sf(df, coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) # converting to an sf point object
+  baltic_simple2 <- st_transform(baltic_simple, st_crs(df_sf))
+  inside <- st_intersects(df_sf, baltic_simple2, sparse = FALSE)[,1] # checking if data point lies within polygon
+  df_sf[inside, ] %>% st_drop_geometry() # return to normal dataframe
+}
+n_after_spatial <- nrow(df)
+
+# MAD filtering (remove parameter NAs and statistical outliers)
+df_final <- {
+  x <- df[[parameter]]
+  med <- median(x, na.rm = TRUE)
+  mad_val <- mad(x, na.rm = TRUE)
+
+  df %>%
+    filter(is.finite(.data[[parameter]])) %>%
+    filter(abs(.data[[parameter]] - med) <= 5 * mad_val) # Threshold of 5 (conservative)
+}
+n_after_mad <- nrow(df_final)
+assign(paste0("filtered_", parameter), df_final)
+
+# Compute losses
+lost_na      <- n_start        - n_after_na
+lost_bbox    <- n_after_na     - n_after_bbox
+lost_spatial <- n_after_bbox   - n_after_spatial
+lost_mad     <- n_after_spatial - n_after_mad
+
+# Print summary
+cat("\n--- Data loss summary ---\n")
+cat(sprintf("Original rows:                %d\n", n_start))
+cat(sprintf("Lost due to NA coordinates:   %d (%.2f%%)\n", lost_na,      100 * lost_na      / n_start))
+cat(sprintf("Lost by bounding box:         %d (%.2f%%)\n", lost_bbox,    100 * lost_bbox    / n_start))
+cat(sprintf("Lost by spatial filtering:    %d (%.2f%%)\n", lost_spatial, 100 * lost_spatial / n_start))
+cat(sprintf("Lost by MAD filtering:        %d (%.2f%%)\n", lost_mad,     100 * lost_mad     / n_start))
+cat(sprintf("Final rows:                   %d (%.2f%% retained)\n",
+            n_after_mad, 100 * n_after_mad / n_start))
+cat("----------------------------\n")
+
+# Delete the temporary variable to maintain an overview of the environment
+rm(df, n_start, n_after_na, n_after_bbox, n_after_spatial, n_after_mad,
+   lost_na, lost_bbox, lost_spatial, lost_mad,
+   df_sf, baltic_simple2, inside, x, med, mad_val, baltic_names)
+gc()
+```
+
+Perform a *sanity check* to ensure the statistical filtering removed outliers (like negative oxygen concentrations) by inspecting the numerical range.
+
+```{r sanity check range}
+# before MAD filtering
+range(get(paste0("combined_", parameter))[[parameter]], na.rm = TRUE)
+# after MAD filtering
+range(get(paste0("filtered_", parameter))[[parameter]], na.rm = TRUE)
+```
+
+## 4 Data visualization
+
+The following graphs are designed to facilitate an initial comprehension of the data. This overview can then be used to inform decisions regarding further visualization or processing of the data.
+
+### 4.1 Overview parameter
+
+```{r visualization parameter}
+# An overview of parameter distribution
+ggplot(get(paste0("filtered_", parameter)), 
+       aes(x = .data[[parameter]])) +
+  geom_histogram(binwidth = 10) +
+  labs(
+    title = "Data overview:",
+    subtitle = paste("Distribution of", parameter),
+    x = paste(parameter, "[", unit, "]"),
+    y = "count"
+  ) +
+  theme_minimal()
+```
+
+### 4.2 Overview devices
+
+```{r visualization devices}
+# An overview of used devices for measuring
+ggplot(get(paste0("filtered_", parameter)), 
+           aes(x = fct_infreq(device))) +
+  geom_bar() +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 25)) +
+  labs(
+    title = "Data overview:",
+    subtitle = paste("Devices used to measure", parameter),
+    x = "devices / device description",
+    y = "count"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8))
+```
+
+It is notable that in many (or most) metadata entries, no devices are documented. Furthermore, there does not appear to be any preselection, as there are different names for the same device.  
+
+### 4.3 Overview temporal data distribution
+
+```{r visualization temporal}
+df_name <- paste0("filtered_", parameter)
+df <- get(df_name)
+
+df$date <- parse_date_time(
+  df$date,
+  orders = c("ymd HMS", "ymd")
+)
+
+ggplot(df, aes(x = date)) +
+  geom_histogram(bins = 50) +
+  labs(
+    title = paste("Abundance of PANGAEA", parameter, "records by time"),
+    x = "year",
+    y = "count"
+  ) +
+  theme_minimal()
+```
+
+For obvious reasons, the years from 2000 onwards are represented much more frequently, although some older research has also been included.\
+\
+
+### 4.4 Spatial visualization
+
+```{r Spatial visualization, message=FALSE, warning=FALSE}
+
+df_surface <- get(paste0("filtered_", parameter)) %>%
+  filter(depth <= 20) %>% # filter for surface waters (< 20m depth)
+  select(longitude, latitude, all_of(parameter)) %>%
+  mutate(layer = "surface (0–20 m)")
+
+df_deep <- get(paste0("filtered_", parameter)) %>%
+  filter(depth > 50) %>% # filter for deeper waters (> 50m depth)
+  select(longitude, latitude, all_of(parameter)) %>%
+  mutate(layer = "deep (>50 m)")
+
+df_plot <- bind_rows(df_surface, df_deep) %>% # combine both layers
+  mutate(layer = factor(layer, levels = c("surface (0–20 m)", "deep (>50 m)")))
+
+# dynamical limits containing 90% of the data
+lims <- quantile(df_plot[[parameter]], probs = c(0.05, 0.95), na.rm = TRUE)
+
+ggplot() +
+  geom_sf(data = baltic_simple, fill = "grey90", color = "grey70") + #background map
+  geom_point(
+    data = df_plot,
+    aes(x = longitude, y = latitude, color = .data[[parameter]]),
+    size = 1.5, alpha = 0.8
+  ) +
+  facet_wrap(~ layer, ncol = 2) + # two images side by side
+  scale_color_viridis_c(
+    limits = lims,   
+    oob = scales::squish   # prevents grey points
+  ) +
+  coord_sf(xlim = c(bbox["xmin"], bbox["xmax"]),
+           ylim = c(bbox["ymin"], bbox["ymax"]),
+           expand = FALSE) +
+  theme_minimal() +
+  labs(
+    title = paste("Local", parameter, "distribution, differentiated by water layers"),
+    x = "Longitude",
+    y = "Latitude",
+    color = paste(parameter, "[", unit, "]")
+  ) +
+  annotation_scale(location = "br") +
+  annotation_north_arrow(
+    location = "tl",
+    style = north_arrow_fancy_orienteering)
+
+rm(df_surface, df_deep, lims, df_plot)
+```
+
+## 5. Results and Discussion
+
+PANGAEA presents itself as a FAIR-aligned repository, but several practical issues limit how findable, interoperable, and reusable the data truly are. Date fields are inconsistent, appearing either as pure dates or as date–time combinations, which complicates automated parsing and merging. Many datasets contain multiple columns for the same parameter, often with different units or naming conventions, making automated selection unreliable. The raw dataframes are large and cluttered, and although they become manageable after trimming, the initial heterogeneity slows down processing. Some datasets contain physically impossible values even after statistical filtering, indicating gaps in quality control. 
+
+Across all steps, it is difficult to avoid hard‑coding because naming conventions, units, and metadata structures vary widely between datasets. These issues collectively undermine the FAIR principles, especially interoperability and reusability, by shifting the burden of harmonization from the repository to the user.
+The metadata is curated by PANGAEA, but the datasets themselves are not, meaning that scientists cause inconsistencies that affect the overall data quality.
